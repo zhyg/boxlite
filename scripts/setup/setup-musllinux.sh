@@ -194,6 +194,9 @@ main() {
 
     install_cargo_nextest
 
+    # Rust/cargo is guaranteed above; bootstrap prek and install hooks best-effort.
+    bootstrap_prek_and_hooks
+
     print_header "Setup Complete"
 }
 
