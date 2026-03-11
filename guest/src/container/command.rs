@@ -3,14 +3,12 @@
 //! Provides a builder pattern for spawning processes inside containers,
 //! following the `std::process::Command` pattern.
 
-use super::capabilities::capability_names;
+use super::zygote::{self, BuildSpec};
 use crate::service::exec::exec_handle::{ExecHandle, PtyConfig};
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
-use libcontainer::container::builder::ContainerBuilder;
-use libcontainer::syscall::syscall::SyscallType;
 use nix::unistd::Pid;
 use std::collections::HashMap;
-use std::os::unix::io::OwnedFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 
 /// Command builder
@@ -226,17 +224,14 @@ impl ContainerCommand {
         self
     }
 
-    /// Spawn the process
+    /// Spawn the process.
     ///
     /// Creates a tenant process in the container with stdin/stdout/stderr pipes.
     /// Returns an [`ExecHandle`] for interacting with the running process.
     ///
-    /// # Errors
-    ///
-    /// - No program specified (must call `.cmd()` first)
-    /// - Failed to create pipes
-    /// - Failed to spawn process
-    /// - Invalid container state
+    /// For PTY mode, this includes the full console-socket handshake.
+    /// If you need to release the container mutex between the zygote build
+    /// and the PTY handshake, use [`spawn_build()`] + [`SpawnedPty::finish()`] instead.
     ///
     /// # Example
     ///
@@ -244,23 +239,33 @@ impl ContainerCommand {
     /// # use guest::container::Container;
     /// # use futures::StreamExt;
     /// # async fn example(container: &Container) -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut child = container.exec().cmd("sh").arg("-c").arg("echo hello").spawn().await?;
-    ///
-    /// // Read output
-    /// while let Some(chunk) = child.output().next().await {
-    ///     println!("{}", String::from_utf8_lossy(&chunk.data));
-    /// }
-    ///
-    /// // Wait for exit
-    /// let status = child.wait().await?;
+    /// let child = container.cmd().program("sh").args(&["-c", "echo hello"]).spawn().await?;
     /// # Ok(())
     /// # }
     /// ```
+    #[allow(dead_code)] // Public API; ContainerExecutor uses spawn_build() for two-phase locking
     pub async fn spawn(self) -> BoxliteResult<ExecHandle> {
+        match self.spawn_build().await? {
+            SpawnResult::Ready(handle) => Ok(handle),
+            SpawnResult::PtyPending(pending) => pending.finish(),
+        }
+    }
+
+    /// Build phase only: zygote IPC without PTY handshake.
+    ///
+    /// Returns [`SpawnResult::Ready`] for non-PTY (handle ready immediately),
+    /// or [`SpawnResult::PtyPending`] for PTY (must call [`SpawnedPty::finish()`]
+    /// to complete the console-socket handshake).
+    ///
+    /// Use this instead of [`spawn()`] when you need to release the container
+    /// mutex between the zygote build and the PTY handshake. The build phase
+    /// serializes `chdir()` in libcontainer; the PTY handshake does not need it.
+    pub(crate) async fn spawn_build(self) -> BoxliteResult<SpawnResult> {
         if let Some(pty_config) = self.pty_config.clone() {
-            self.spawn_with_pty(pty_config).await
+            self.spawn_pty_build(pty_config).await
         } else {
-            self.spawn_with_pipes().await
+            let handle = self.spawn_with_pipes().await?;
+            Ok(SpawnResult::Ready(handle))
         }
     }
 
@@ -276,12 +281,12 @@ impl ContainerCommand {
         let (stderr_read, stderr_write) = pipe()
             .map_err(|e| BoxliteError::Internal(format!("Failed to create stderr pipe: {}", e)))?;
 
-        tracing::debug!(container_id = %self.id, "Spawning with pipes");
+        tracing::debug!(container_id = %self.id, "spawning with pipes");
 
         let pipes = Some((stdin_read, stdout_write, stderr_write));
         let pid = self.build_and_spawn(pipes).await?;
 
-        tracing::debug!(pid = pid.as_raw(), "Spawned with pipes");
+        tracing::debug!(pid = pid.as_raw(), "spawned with pipes");
         // Non-PTY mode: stdout and stderr are separate pipes
         Ok(ExecHandle::new(
             pid,
@@ -291,29 +296,31 @@ impl ContainerCommand {
         ))
     }
 
-    /// Spawn process with PTY (interactive mode).
-    async fn spawn_with_pty(mut self, config: PtyConfig) -> BoxliteResult<ExecHandle> {
+    /// Build phase of PTY spawn: zygote IPC only, no console-socket handshake.
+    ///
+    /// Creates the console socket, sends the build spec to the zygote, and
+    /// returns a [`SpawnedPty`] that captures the PID + socket for later
+    /// completion via [`SpawnedPty::finish()`].
+    async fn spawn_pty_build(mut self, config: PtyConfig) -> BoxliteResult<SpawnResult> {
         use super::console_socket::ConsoleSocket;
 
-        // Setup console socket
         let exec_id = uuid::Uuid::new_v4().to_string();
         let socket = ConsoleSocket::new(&exec_id)?;
 
         tracing::debug!(
             container_id = %self.id,
             console_socket = %socket.path(),
-            "Spawning with PTY"
+            "spawning with PTY (build phase)"
         );
 
-        // Spawn process with console socket
         self.console_socket = Some(socket.path().to_string());
         let pid = self.build_and_spawn(None).await?;
 
-        // Receive PTY master FD (socket auto-cleanup on drop)
-        let pty_master = socket.receive_pty_master()?;
-
-        // Create child with PTY
-        create_pty_child(pid, pty_master, config)
+        Ok(SpawnResult::PtyPending(SpawnedPty {
+            pid,
+            socket,
+            config,
+        }))
     }
 
     /// Resolve the effective (uid, gid) for this exec.
@@ -338,110 +345,125 @@ impl ContainerCommand {
         }
     }
 
-    /// Build and spawn process using libcontainer.
+    /// Build and spawn process via the zygote.
+    ///
+    /// Sends a BuildSpec to the zygote process (forked before tokio started),
+    /// which calls ContainerBuilder::build() in a single-threaded context.
+    /// This avoids the musl __malloc_lock deadlock on clone3().
+    ///
+    /// Uses spawn_blocking because the IPC round-trip blocks until the
+    /// zygote completes the build.
     async fn build_and_spawn(
         &self,
         pipes: Option<(OwnedFd, OwnedFd, OwnedFd)>,
     ) -> BoxliteResult<Pid> {
-        // Build command arguments
-        let program = self.program.clone().unwrap_or("".into());
+        let program = self.program.clone().unwrap_or_default();
         let mut container_args = vec![program.clone()];
         container_args.extend_from_slice(self.args.as_slice());
 
-        // Build container
-        let mut builder = ContainerBuilder::new(self.id.to_string(), SyscallType::default())
-            .with_root_path(self.state_root.clone())
-            .map_err(|e| {
-                BoxliteError::Internal(format!("Failed to set container root path: {}", e))
-            })?
-            .with_console_socket(self.console_socket.clone())
-            .validate_id()
-            .map_err(|e| BoxliteError::Internal(format!("Invalid container ID: {}", e)))?;
-
-        // Add pipes if provided
-        if let Some((stdin, stdout, stderr)) = pipes {
-            builder = builder
-                .with_stdin(stdin)
-                .with_stdout(stdout)
-                .with_stderr(stderr);
-        }
-
-        // Configure and spawn
-        tracing::debug!(
-            container_id = %self.id,
-            state_root = %self.state_root.display(),
-            program = %program,
-            args = ?container_args,
-            "About to call libcontainer build() to exec into container"
-        );
-
-        // Check container status before attempting exec
-        let container_state_path = self.state_root.join(&self.id);
-        if let Ok(container) =
-            libcontainer::container::Container::load(container_state_path.clone())
-        {
-            tracing::debug!(
-                container_id = %self.id,
-                status = ?container.status(),
-                state_path = %container_state_path.display(),
-                "Container status before exec"
-            );
-        } else {
-            tracing::warn!(
-                container_id = %self.id,
-                state_path = %container_state_path.display(),
-                "Failed to load container status before exec"
-            );
-        }
-
         let (uid, gid) = self.resolve_exec_user()?;
 
-        let pid = builder
-            .as_tenant()
-            .with_capabilities(capability_names())
-            .with_no_new_privs(false)
-            .with_detach(false)
-            .with_cwd(self.cwd.clone().or(Some("/".parse().unwrap())))
-            .with_env(self.env.clone())
-            .with_container_args(container_args.clone())
-            .with_user(Some(uid))
-            .with_group(Some(gid))
-            .build()
-            .map_err(|e| {
-                tracing::error!(
-                    container_id = %self.id,
-                    program = %program,
-                    args = ?container_args,
-                    error = %e,
-                    state_root = %self.state_root.display(),
-                    "Libcontainer build() failed - likely container status issue"
-                );
-
-                // Try to get container status after failure
-                let container_state_path = self.state_root.join(&self.id);
-                if let Ok(container) =
-                    libcontainer::container::Container::load(container_state_path.clone())
-                {
-                    tracing::error!(
-                        container_id = %self.id,
-                        status = ?container.status(),
-                        "Container status after exec failure"
-                    );
-                }
-
-                BoxliteError::Internal(format!(
-                    "Failed to spawn '{}' with args {:?}: {}",
-                    program, container_args, e
-                ))
-            })?;
-
         tracing::debug!(
             container_id = %self.id,
+            program = %program,
+            args = ?container_args,
+            "sending build to zygote"
+        );
+
+        let build_start = std::time::Instant::now();
+        tracing::info!(
+            container_id = %self.id,
+            program = %program,
+            "exec: build starting"
+        );
+
+        let spec = BuildSpec {
+            container_id: self.id.clone(),
+            state_root: self.state_root.clone(),
+            console_socket: self.console_socket.clone(),
+            cwd: self.cwd.clone().unwrap_or_else(|| "/".to_string()).into(),
+            env: self.env.clone(),
+            args: container_args.clone(),
+            uid,
+            gid,
+        };
+
+        // Blocking IPC to zygote — use spawn_blocking to not block tokio.
+        // pipes must live until sendmsg duplicates them via SCM_RIGHTS,
+        // then drop to close the parent's copies (so pipe readers see EOF).
+        let pid = tokio::task::spawn_blocking(move || {
+            let raw_fds = pipes
+                .as_ref()
+                .map(|(a, b, c)| [a.as_raw_fd(), b.as_raw_fd(), c.as_raw_fd()]);
+            let result = zygote::ZYGOTE
+                .get()
+                .expect("zygote not started")
+                .build(spec, raw_fds);
+            // Close parent's copies AFTER build() — zygote has its own via SCM_RIGHTS.
+            // Without this, pipe readers in the parent never see EOF.
+            drop(pipes);
+            result
+        })
+        .await
+        .map_err(|e| BoxliteError::Internal(format!("build join error: {e}")))?
+        .map_err(|e| {
+            tracing::error!(
+                container_id = %self.id,
+                program = %program,
+                args = ?container_args,
+                error = %e,
+                "zygote build failed"
+            );
+            e
+        })?;
+
+        tracing::info!(
+            container_id = %self.id,
             pid = pid.as_raw(),
-            "Successfully spawned process in container"
+            elapsed_ms = build_start.elapsed().as_millis() as u64,
+            "exec: build completed"
         );
 
         Ok(pid)
+    }
+}
+
+/// Result of [`ContainerCommand::spawn_build()`].
+///
+/// Non-PTY commands produce a ready [`ExecHandle`] immediately.
+/// PTY commands produce a [`SpawnedPty`] that must be completed
+/// via [`SpawnedPty::finish()`] after releasing the container mutex.
+pub(crate) enum SpawnResult {
+    /// Non-PTY: handle is ready immediately.
+    Ready(ExecHandle),
+    /// PTY: build is done, but the console-socket handshake is pending.
+    PtyPending(SpawnedPty),
+}
+
+/// Intermediate state between zygote build and PTY handshake.
+///
+/// Holds the PID (from `build_and_spawn`) and the console socket
+/// needed to receive the PTY master FD from libcontainer.
+///
+/// Call [`finish()`] to complete the handshake. This blocks on
+/// `accept()` + `recvmsg()` with a 30s timeout.
+pub(crate) struct SpawnedPty {
+    pid: Pid,
+    socket: super::console_socket::ConsoleSocket,
+    config: PtyConfig,
+}
+
+impl SpawnedPty {
+    /// Complete the PTY handshake and create the [`ExecHandle`].
+    ///
+    /// Blocks on the console-socket `accept()` + `recvmsg()` to receive
+    /// the PTY master FD from libcontainer. Has a 30s timeout.
+    ///
+    /// Call this AFTER releasing the container mutex — the handshake
+    /// does not need serialization.
+    pub(crate) fn finish(self) -> BoxliteResult<ExecHandle> {
+        let pty_master = self.socket.receive_pty_master()?;
+        create_pty_child(self.pid, pty_master, self.config)
     }
 }
 
@@ -554,5 +576,97 @@ mod tests {
     fn test_with_user_numeric() {
         let cmd = make_cmd().with_user("1000:1000".to_string());
         assert_eq!(cmd.user_override, Some("1000:1000".to_string()));
+    }
+
+    // ========================================================================
+    // BUILDER PATTERN TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_builder_program() {
+        let cmd = make_cmd().program("ls");
+        assert_eq!(cmd.program, Some("ls".to_string()));
+    }
+
+    #[test]
+    fn test_builder_args_replaces() {
+        let cmd = make_cmd().arg("first").args(["second", "third"]);
+        assert_eq!(cmd.args, vec!["second".to_string(), "third".to_string()]);
+    }
+
+    #[test]
+    fn test_builder_arg_appends() {
+        let cmd = make_cmd().arg("first").arg("second");
+        assert_eq!(cmd.args, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn test_builder_env_single() {
+        let cmd = make_cmd().env("KEY", "VALUE");
+        assert_eq!(cmd.env.get("KEY"), Some(&"VALUE".to_string()));
+    }
+
+    #[test]
+    fn test_builder_envs_merges_and_overrides() {
+        let cmd = make_cmd().env("A", "1").envs(vec![("B", "2"), ("A", "3")]);
+        assert_eq!(cmd.env.get("A"), Some(&"3".to_string()));
+        assert_eq!(cmd.env.get("B"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_builder_current_dir() {
+        let cmd = make_cmd().current_dir("/home");
+        assert_eq!(cmd.cwd, Some("/home".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_pty() {
+        let config = PtyConfig {
+            rows: 24,
+            cols: 80,
+            x_pixels: 0,
+            y_pixels: 0,
+        };
+        let cmd = make_cmd().with_pty(config);
+        let pty = cmd.pty_config.unwrap();
+        assert_eq!(pty.rows, 24);
+        assert_eq!(pty.cols, 80);
+    }
+
+    #[test]
+    fn test_builder_full_chain() {
+        let cmd = make_cmd()
+            .program("sh")
+            .args(["-c", "echo hello"])
+            .env("FOO", "bar")
+            .envs(vec![("BAZ", "qux")])
+            .current_dir("/tmp")
+            .with_user("nobody".to_string());
+
+        assert_eq!(cmd.program, Some("sh".to_string()));
+        assert_eq!(cmd.args, vec!["-c".to_string(), "echo hello".to_string()]);
+        assert_eq!(cmd.env.get("FOO"), Some(&"bar".to_string()));
+        assert_eq!(cmd.env.get("BAZ"), Some(&"qux".to_string()));
+        assert_eq!(cmd.cwd, Some("/tmp".to_string()));
+        assert_eq!(cmd.user_override, Some("nobody".to_string()));
+    }
+
+    // ========================================================================
+    // RESOLVE EXEC USER TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_exec_user_default() {
+        let cmd = make_cmd();
+        let (uid, gid) = cmd.resolve_exec_user().unwrap();
+        assert_eq!((uid, gid), (0, 0));
+    }
+
+    #[test]
+    fn test_resolve_exec_user_override_without_valid_rootfs() {
+        let mut cmd = make_cmd().with_user("nobody".to_string());
+        cmd.rootfs = None;
+        let result = cmd.resolve_exec_user();
+        assert!(result.is_err());
     }
 }

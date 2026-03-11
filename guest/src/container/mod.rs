@@ -53,10 +53,6 @@
 //!         eprintln!("err: {}", String::from_utf8_lossy(&line));
 //!     }
 //! });
-//!
-//! // Wait for exit
-//! let status = child.wait().await?;
-//! println!("Exit code: {}", status.code());
 //! # Ok(())
 //! # }
 //! ```
@@ -77,7 +73,11 @@ mod spec;
 mod start;
 #[cfg(target_os = "linux")]
 mod stdio;
+#[cfg(target_os = "linux")]
+pub(crate) mod zygote;
 
+#[cfg(target_os = "linux")]
+pub(crate) use command::SpawnResult;
 #[cfg(target_os = "linux")]
 pub use lifecycle::Container;
 #[cfg(target_os = "linux")]

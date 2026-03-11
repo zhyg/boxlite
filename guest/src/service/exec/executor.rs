@@ -38,8 +38,17 @@ impl ContainerExecutor {
 #[async_trait]
 impl Executor for ContainerExecutor {
     async fn spawn(&self, req: &ExecRequest) -> BoxliteResult<ExecHandle> {
-        // Build the command while holding the lock
-        let cmd = {
+        use crate::container::SpawnResult;
+
+        let start = std::time::Instant::now();
+
+        // Phase 1 (mutex held): build command + zygote IPC.
+        //
+        // Serialize build+spawn: libcontainer's build() uses process-global
+        // chdir(). Concurrent builds corrupt each other's cwd, causing hangs
+        // in clone3/waitpid. The mutex is released BEFORE the PTY handshake
+        // so a stuck console-socket doesn't block other execs or shutdown.
+        let spawn_result = {
             let container = self.container.lock().await;
 
             let mut cmd = container
@@ -65,10 +74,26 @@ impl Executor for ContainerExecutor {
                 cmd = cmd.with_user(user.clone());
             }
 
-            cmd
-        }; // Release container lock before spawn
+            cmd.spawn_build().await?
+            // container mutex dropped here
+        };
 
-        cmd.spawn().await
+        // Phase 2 (no mutex): complete PTY handshake if needed.
+        //
+        // receive_pty_master() blocks on accept() + recvmsg() with a 30s
+        // timeout. This does NOT need the container mutex — chdir() is done.
+        let result = match spawn_result {
+            SpawnResult::Ready(handle) => Ok(handle),
+            SpawnResult::PtyPending(pending) => pending.finish(),
+        };
+
+        tracing::info!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            program = %req.program,
+            "exec: spawn completed"
+        );
+
+        result
     }
 }
 

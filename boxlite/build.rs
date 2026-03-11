@@ -720,7 +720,9 @@ impl EmbeddedManifest {
         }
 
         // Linux gnu (static glibc — Go c-archive is incompatible with musl TLS)
-        for arch in ["x86_64", "aarch64"] {
+        // Check matching architecture first to avoid picking wrong binary on
+        // multi-arch machines.
+        for arch in Self::preferred_arches() {
             let gnu = target_dir
                 .join(format!("{}-unknown-linux-gnu", arch))
                 .join(profile)
@@ -735,22 +737,36 @@ impl EmbeddedManifest {
 
     /// Find pre-built boxlite-guest binary for the given build profile.
     ///
-    /// Search order:
-    /// 1. `target/{target-triple}/{profile}/boxlite-guest` (direct build output)
+    /// Checks matching architecture first to avoid picking wrong binary on
+    /// multi-arch machines (e.g., x86_64 guest embedded into aarch64 build).
     fn find_prebuilt_guest(workspace_root: &Path, profile: &str) -> Option<PathBuf> {
         let target_dir = workspace_root.join("target");
 
-        // Direct build output for known guest targets
-        let guest_targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
-
-        for target in guest_targets {
-            let path = target_dir.join(target).join(profile).join("boxlite-guest");
+        // Check matching architecture first, then fall back to others
+        for arch in Self::preferred_arches() {
+            let path = target_dir
+                .join(format!("{}-unknown-linux-musl", arch))
+                .join(profile)
+                .join("boxlite-guest");
             if path.is_file() {
                 return Some(path);
             }
         }
 
         None
+    }
+
+    /// Return architecture list with the build target's arch first.
+    ///
+    /// On multi-arch machines with both x86_64 and aarch64 binaries built,
+    /// this ensures we pick the one matching the current build target.
+    fn preferred_arches() -> Vec<&'static str> {
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        match arch.as_str() {
+            "aarch64" => vec!["aarch64", "x86_64"],
+            "x86_64" => vec!["x86_64", "aarch64"],
+            _ => vec!["x86_64", "aarch64"],
+        }
     }
 }
 
@@ -829,29 +845,34 @@ fn main() {
 /// Compute SHA256 hash of the `boxlite-guest` binary and embed it via `cargo:rustc-env`.
 ///
 /// Search order:
-/// 1. `runtime_dir` (OUT_DIR/runtime/ — for prebuilt mode)
-/// 2. `target/boxlite-runtime/boxlite-guest` (assembled by `make runtime:debug`)
+/// 1. Direct build output: `target/{target-triple}/{profile}/boxlite-guest`
+/// 2. `runtime_dir` (OUT_DIR/runtime/ — for prebuilt mode)
+///
+/// IMPORTANT: The source binary (direct build output) must be checked FIRST because
+/// `compute_guest_hash` runs before `generate()` in main(). The OUT_DIR/runtime/ copy
+/// is placed there by a previous build's `generate()` and may be stale when the guest
+/// binary has been rebuilt since then.
 ///
 /// If the binary isn't found, silently skips — runtime will compute the hash as fallback.
 fn compute_guest_hash(runtime_dir: &Path) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
 
-    let candidates = [
-        runtime_dir.join("boxlite-guest"),
-        manifest_dir
-            .parent()
-            .map(|root| root.join("target/boxlite-runtime/boxlite-guest"))
-            .unwrap_or_default(),
-    ];
-
-    let guest_path = candidates.iter().find(|p| p.is_file());
+    // Check source binary first (direct build output) to avoid stale OUT_DIR copies.
+    let workspace_root = manifest_dir.parent().unwrap_or(&manifest_dir);
+    let guest_path =
+        EmbeddedManifest::find_prebuilt_guest(workspace_root, &profile).or_else(|| {
+            // Fallback: OUT_DIR copy (for prebuilt/CI mode where source isn't available)
+            let p = runtime_dir.join("boxlite-guest");
+            p.is_file().then_some(p)
+        });
 
     let Some(guest_path) = guest_path else {
         println!("cargo:warning=boxlite-guest not found, skipping compile-time hash");
         return;
     };
 
-    match sha256_file(guest_path) {
+    match sha256_file(&guest_path) {
         Ok(hash) => {
             println!("cargo:rustc-env=BOXLITE_GUEST_HASH={}", hash);
             println!("cargo:rerun-if-changed={}", guest_path.display());

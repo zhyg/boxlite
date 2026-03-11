@@ -154,48 +154,89 @@ impl ExecutionState {
 
     /// Wait for process to exit.
     ///
-    /// Gets pid from handle and waits using waitpid.
+    /// Routes to the correct wait mechanism based on executor type:
+    /// - Container processes (init_health.is_some()) → zygote IPC polling
+    /// - Guest processes (init_health.is_none()) → direct waitpid
     pub async fn wait_process(
         &self,
+    ) -> Result<crate::service::exec::exec_handle::ExitStatus, Status> {
+        let (pid, is_container) = {
+            let inner = self.inner.lock().await;
+            let pid = inner
+                .handle
+                .as_ref()
+                .ok_or_else(|| Status::failed_precondition("Handle not available"))?
+                .pid();
+            (pid, inner.init_health.is_some())
+        };
+
+        if is_container {
+            Self::wait_via_zygote(pid).await
+        } else {
+            Self::wait_direct(pid).await
+        }
+    }
+
+    /// Wait for a container process via zygote WNOHANG polling.
+    ///
+    /// Container processes are children of the zygote (created by clone3).
+    /// Uses WNOHANG to avoid holding the zygote Mutex for the process lifetime.
+    /// Retries every 10ms until the process exits.
+    async fn wait_via_zygote(
+        pid: nix::unistd::Pid,
+    ) -> Result<crate::service::exec::exec_handle::ExitStatus, Status> {
+        use crate::container::zygote;
+        use crate::service::exec::exec_handle::ExitStatus;
+
+        loop {
+            let result = tokio::task::spawn_blocking(move || {
+                zygote::ZYGOTE.get().expect("zygote not started").wait(pid)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?
+            .map_err(|e| Status::internal(format!("zygote wait failed: {e}")))?;
+
+            match result {
+                zygote::WaitResult::StillAlive => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                zygote::WaitResult::Exited { code } => return Ok(ExitStatus::Code(code)),
+                zygote::WaitResult::Signaled { signal } => {
+                    return Ok(ExitStatus::Signal(
+                        nix::sys::signal::Signal::try_from(signal)
+                            .unwrap_or(nix::sys::signal::Signal::SIGKILL),
+                    ))
+                }
+                zygote::WaitResult::Failed { error } => {
+                    return Err(Status::internal(format!("wait failed: {error}")))
+                }
+            }
+        }
+    }
+
+    /// Wait for a guest process via direct waitpid.
+    ///
+    /// Guest processes are spawned by std::process::Command and are direct
+    /// children of this process. Blocking waitpid is fine here since it
+    /// doesn't hold any shared mutex.
+    async fn wait_direct(
+        pid: nix::unistd::Pid,
     ) -> Result<crate::service::exec::exec_handle::ExitStatus, Status> {
         use crate::service::exec::exec_handle::ExitStatus;
         use nix::sys::wait::{waitpid, WaitStatus};
 
-        // Get pid from handle
-        let pid = {
-            let inner = self.inner.lock().await;
-            inner
-                .handle
-                .as_ref()
-                .ok_or_else(|| Status::failed_precondition("Handle not available"))?
-                .pid()
-        };
-
-        // Wait for process (blocking call in spawn_blocking)
-        let result = tokio::task::spawn_blocking(move || waitpid(pid, None))
-            .await
-            .map_err(|e| Status::internal(format!("spawn_blocking failed: {}", e)))?;
-
-        let result = match result {
-            Ok(status) => status,
-            Err(nix::errno::Errno::ECHILD) => {
-                // Child already reaped — process exited but exit code is lost.
-                // This can happen if another reaper (container init, signal handler)
-                // called waitpid() before us. Return 0 as best-effort.
-                tracing::debug!(pid = pid.as_raw(), "waitpid ECHILD: child already reaped");
-                return Ok(ExitStatus::Code(0));
-            }
-            Err(e) => return Err(Status::internal(format!("waitpid failed: {}", e))),
-        };
-
-        match result {
-            WaitStatus::Exited(_, code) => Ok(ExitStatus::Code(code)),
-            WaitStatus::Signaled(_, sig, _) => Ok(ExitStatus::Signal(sig)),
-            other => Err(Status::internal(format!(
-                "Unexpected wait status: {:?}",
-                other
+        #[allow(clippy::result_large_err)] // Status is the standard error type in this module
+        tokio::task::spawn_blocking(move || match waitpid(pid, None) {
+            Ok(WaitStatus::Exited(_, code)) => Ok(ExitStatus::Code(code)),
+            Ok(WaitStatus::Signaled(_, signal, _)) => Ok(ExitStatus::Signal(signal)),
+            Ok(other) => Err(Status::internal(format!(
+                "unexpected wait status: {other:?}"
             ))),
-        }
+            Err(e) => Err(Status::internal(format!("waitpid({pid}) failed: {e}"))),
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking failed: {e}")))?
     }
 
     /// Attach to execution output.
