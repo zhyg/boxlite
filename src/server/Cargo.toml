@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 boxlite = { path = "../boxlite" }
-boxlite-shared = { path = "../boxlite-shared" }
+boxlite-shared = { path = "../shared" }
 
 # gRPC
 tonic = "0.12"
