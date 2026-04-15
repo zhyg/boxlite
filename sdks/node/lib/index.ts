@@ -20,6 +20,11 @@
  */
 
 import { getNativeModule, getJsBoxlite } from "./native.js";
+export type {
+  ImageHandle,
+  ImageInfo,
+  ImagePullResult,
+} from "./native-contracts.js";
 
 // Re-export native bindings
 export const JsBoxlite = getJsBoxlite();

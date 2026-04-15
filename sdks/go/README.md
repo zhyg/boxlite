@@ -9,7 +9,7 @@ go get github.com/boxlite-ai/boxlite/sdks/go
 go run github.com/boxlite-ai/boxlite/sdks/go/cmd/setup
 ```
 
-Requires Go 1.24+ with CGO enabled. The setup step downloads the prebuilt native library from GitHub Releases (one-time). Set `GITHUB_TOKEN` to avoid API rate limits.
+Requires Go 1.24+ with CGO enabled. The setup step downloads the prebuilt native library and header into the module directory in your Go module cache (one-time). Set `GITHUB_TOKEN` to avoid API rate limits.
 
 ## Usage
 
@@ -55,6 +55,31 @@ func main() {
 	}
 
 	fmt.Println("Box started successfully!")
+}
+```
+
+### Runtime Image Management
+
+```go
+ctx := context.Background()
+images, err := rt.Images()
+if err != nil {
+	log.Fatal(err)
+}
+defer images.Close()
+
+pull, err := images.Pull(ctx, "alpine:latest")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(pull.Reference, pull.ConfigDigest, pull.LayerCount)
+
+cached, err := images.List(ctx)
+if err != nil {
+	log.Fatal(err)
+}
+for _, image := range cached {
+	fmt.Println(image.Repository, image.Tag, image.ID)
 }
 ```
 
